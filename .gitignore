@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+probe_output/
+
+bosch-thermostat-client-python/
+home-assistant-bosch-custom-component/
+bosch_local_bridge_investigation.md
+investigation-summary.md

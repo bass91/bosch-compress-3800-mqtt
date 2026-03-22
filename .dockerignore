@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+probe_output
+bosch-thermostat-client-python
+home-assistant-bosch-custom-component
+deep-research-report-3.md
+*.md

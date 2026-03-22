@@ -1,0 +1,8 @@
+services:
+  bosch-mqtt-bridge:
+    build:
+      context: .
+    container_name: bosch-mqtt-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
