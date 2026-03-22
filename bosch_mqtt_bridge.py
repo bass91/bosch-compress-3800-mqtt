@@ -322,29 +322,35 @@ def publish_discovery(publisher: HomeAssistantMqttPublisher) -> None:
 
 def publish_live_values(client: BoschHttpClient, publisher: HomeAssistantMqttPublisher) -> None:
     for spec in LIVE_SENSOR_SPECS:
-        payload = client.get(spec.path)
-        publisher.publish_state(
-            spec.object_id,
-            payload.get("value"),
-            {
-                "path": spec.path,
-                "unit_of_measure": payload.get("unitOfMeasure"),
-                "type": payload.get("type"),
-                "recordable": payload.get("recordable"),
-                "writeable": payload.get("writeable"),
-            },
-        )
+        try:
+            payload = client.get(spec.path)
+            publisher.publish_state(
+                spec.object_id,
+                payload.get("value"),
+                {
+                    "path": spec.path,
+                    "unit_of_measure": payload.get("unitOfMeasure"),
+                    "type": payload.get("type"),
+                    "recordable": payload.get("recordable"),
+                    "writeable": payload.get("writeable"),
+                },
+            )
+        except Exception as err:
+            LOG.warning("Failed to read %s: %s", spec.path, err)
 
     for spec in LIVE_BINARY_SPECS:
-        payload = client.get(spec["path"])
-        publisher.publish_state(
-            spec["object_id"],
-            payload.get("value"),
-            {
-                "path": spec["path"],
-                "allowed_values": payload.get("allowedValues"),
-            },
-        )
+        try:
+            payload = client.get(spec["path"])
+            publisher.publish_state(
+                spec["object_id"],
+                payload.get("value"),
+                {
+                    "path": spec["path"],
+                    "allowed_values": payload.get("allowedValues"),
+                },
+            )
+        except Exception as err:
+            LOG.warning("Failed to read %s: %s", spec["path"], err)
 
     try:
         consumption = client.get("/heatSources/energyMonitoring/consumption")
@@ -377,9 +383,14 @@ def publish_recording_summaries(client: BoschHttpClient, publisher: HomeAssistan
     raw_payloads: dict[str, dict[str, Any]] = {}
 
     for spec in RECORDING_SPECS:
-        raw_payloads[spec["slug"]] = fetch_recording_for_day(client, spec["path"], target_date)
+        try:
+            raw_payloads[spec["slug"]] = fetch_recording_for_day(client, spec["path"], target_date)
+        except Exception as err:
+            LOG.warning("Failed to read recording %s: %s", spec["path"], err)
 
-    compressor = raw_payloads["compressor"]
+    compressor = raw_payloads.get("compressor")
+    if not compressor:
+        return
     compressor_buckets = compressor.get("recording", [])
     if compressor_buckets and last_hour_index < len(compressor_buckets):
         bucket = compressor_buckets[last_hour_index]
@@ -406,7 +417,9 @@ def publish_recording_summaries(client: BoschHttpClient, publisher: HomeAssistan
         )
 
     for spec in [x for x in RECORDING_SPECS if x["kind"] == "energy"]:
-        payload = raw_payloads[spec["slug"]]
+        payload = raw_payloads.get(spec["slug"])
+        if not payload:
+            continue
         buckets = payload.get("recording", [])
         if not buckets or last_hour_index >= len(buckets):
             continue
@@ -483,12 +496,18 @@ def run_bridge(args: argparse.Namespace) -> int:
             now = time.monotonic()
             if now >= next_live:
                 LOG.info("Polling live Bosch values")
-                publish_live_values(client, publisher)
+                try:
+                    publish_live_values(client, publisher)
+                except Exception:
+                    LOG.exception("Live poll failed")
                 next_live = now + max(args.live_interval, 5)
 
             if now >= next_recordings:
                 LOG.info("Polling recording summaries")
-                publish_recording_summaries(client, publisher)
+                try:
+                    publish_recording_summaries(client, publisher)
+                except Exception:
+                    LOG.exception("Recording poll failed")
                 next_recordings = now + max(args.recordings_interval, 300)
 
             if args.once:
