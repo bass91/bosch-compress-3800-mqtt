@@ -34,6 +34,8 @@ MQTT_HOST=192.168.68.149
 MQTT_PORT=1883
 MQTT_USER=bosch
 MQTT_PASSWORD=your_mqtt_password
+BOSCH_CONTAINER_UID=1000
+BOSCH_CONTAINER_GID=1000
 BOSCH_STATE_PATH=/data/bridge_state.json
 BOSCH_CUMULATIVE_BACKFILL_DAYS=7
 BOSCH_TIMEZONE=Europe/Stockholm
@@ -46,6 +48,7 @@ docker compose up -d --build
 ```
 
 This creates a local `./state` directory on the server for cumulative totals.
+The container runs as your host UID/GID by default so `./state` stays writable.
 
 Logs:
 

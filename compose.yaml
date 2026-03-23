@@ -3,6 +3,7 @@ services:
     build:
       context: .
     container_name: bosch-mqtt-bridge
+    user: "${BOSCH_CONTAINER_UID:-1000}:${BOSCH_CONTAINER_GID:-1000}"
     restart: unless-stopped
     env_file:
       - .env
