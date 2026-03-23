@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from bosch_local_probe import BoschHttpClient
 
@@ -50,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ha-discovery-prefix", default=os.getenv("HA_DISCOVERY_PREFIX", "homeassistant"))
     parser.add_argument("--live-interval", type=int, default=int(os.getenv("BOSCH_LIVE_INTERVAL", "30")))
     parser.add_argument("--recordings-interval", type=int, default=int(os.getenv("BOSCH_RECORDINGS_INTERVAL", "3600")))
+    parser.add_argument(
+        "--timezone",
+        default=os.getenv("BOSCH_TIMEZONE", os.getenv("TZ", "UTC")),
+        help="Timezone used for daily recording rollovers, for example Europe/Stockholm.",
+    )
     parser.add_argument("--once", action="store_true", help="Run one poll cycle and exit.")
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     return parser.parse_args()
@@ -145,6 +151,15 @@ def clean_unit(unit: str | None) -> str | None:
 def get_last_full_hour_reference(now: datetime) -> tuple[date, int]:
     target = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
     return target.date(), target.hour
+
+
+def load_timezone(timezone_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as err:
+        raise SystemExit(
+            f"Unknown timezone '{timezone_name}'. Use an IANA name like Europe/Stockholm."
+        ) from err
 
 
 def safe_div(y_value: float | int, count: float | int) -> float | None:
@@ -377,8 +392,12 @@ def fetch_recording_for_day(client: BoschHttpClient, path: str, target_date: dat
     return client.get(f"{path}?interval={target_date.isoformat()}")
 
 
-def publish_recording_summaries(client: BoschHttpClient, publisher: HomeAssistantMqttPublisher) -> None:
-    now = datetime.now()
+def publish_recording_summaries(
+    client: BoschHttpClient,
+    publisher: HomeAssistantMqttPublisher,
+    bridge_tz: ZoneInfo,
+) -> None:
+    now = datetime.now(bridge_tz)
     target_date, last_hour_index = get_last_full_hour_reference(now)
     raw_payloads: dict[str, dict[str, Any]] = {}
 
@@ -401,6 +420,7 @@ def publish_recording_summaries(client: BoschHttpClient, publisher: HomeAssistan
             None if duty_ratio is None else round(duty_ratio * 100, 2),
             {
                 "path": compressor["recordedResource"]["id"],
+                "bridge_timezone": str(bridge_tz),
                 "bucket_date": target_date.isoformat(),
                 "bucket_hour": last_hour_index,
                 "raw_bucket": bucket,
@@ -411,6 +431,7 @@ def publish_recording_summaries(client: BoschHttpClient, publisher: HomeAssistan
             runtime_today_hours,
             {
                 "path": compressor["recordedResource"]["id"],
+                "bridge_timezone": str(bridge_tz),
                 "bucket_date": target_date.isoformat(),
                 "last_hour_index": last_hour_index,
             },
@@ -431,6 +452,7 @@ def publish_recording_summaries(client: BoschHttpClient, publisher: HomeAssistan
             last_hour_value,
             {
                 "path": payload["recordedResource"]["id"],
+                "bridge_timezone": str(bridge_tz),
                 "bucket_date": target_date.isoformat(),
                 "bucket_hour": last_hour_index,
                 "raw_bucket": bucket,
@@ -441,6 +463,7 @@ def publish_recording_summaries(client: BoschHttpClient, publisher: HomeAssistan
             today_total,
             {
                 "path": payload["recordedResource"]["id"],
+                "bridge_timezone": str(bridge_tz),
                 "bucket_date": target_date.isoformat(),
                 "last_hour_index": last_hour_index,
             },
@@ -449,10 +472,12 @@ def publish_recording_summaries(client: BoschHttpClient, publisher: HomeAssistan
 
 def run_bridge(args: argparse.Namespace) -> int:
     mqtt = import_mqtt()
+    bridge_tz = load_timezone(args.timezone)
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    LOG.info("Using recording timezone %s", bridge_tz)
 
     client = BoschHttpClient(
         host=args.host,
@@ -505,7 +530,7 @@ def run_bridge(args: argparse.Namespace) -> int:
             if now >= next_recordings:
                 LOG.info("Polling recording summaries")
                 try:
-                    publish_recording_summaries(client, publisher)
+                    publish_recording_summaries(client, publisher, bridge_tz)
                 except Exception:
                     LOG.exception("Recording poll failed")
                 next_recordings = now + max(args.recordings_interval, 300)

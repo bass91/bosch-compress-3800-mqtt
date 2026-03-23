@@ -34,6 +34,7 @@ MQTT_HOST=192.168.68.149
 MQTT_PORT=1883
 MQTT_USER=bosch
 MQTT_PASSWORD=your_mqtt_password
+BOSCH_TIMEZONE=Europe/Stockholm
 ```
 
 ## Run
@@ -63,4 +64,5 @@ The bridge publishes MQTT discovery under `homeassistant/...`, so entities shoul
 
 - Live values are polled every `30s` by default.
 - Recording summaries are polled every `3600s` by default.
+- Daily recording rollovers use `BOSCH_TIMEZONE`, default `UTC`.
 - Energy values are based on Bosch recording buckets, not live monotonic counters.
