@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 
 probe_output/
+state/
 
 bosch-thermostat-client-python/
 home-assistant-bosch-custom-component/

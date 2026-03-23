@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import signal
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -51,6 +52,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ha-discovery-prefix", default=os.getenv("HA_DISCOVERY_PREFIX", "homeassistant"))
     parser.add_argument("--live-interval", type=int, default=int(os.getenv("BOSCH_LIVE_INTERVAL", "30")))
     parser.add_argument("--recordings-interval", type=int, default=int(os.getenv("BOSCH_RECORDINGS_INTERVAL", "3600")))
+    parser.add_argument(
+        "--state-path",
+        default=os.getenv("BOSCH_STATE_PATH", "bridge_state.json"),
+        help="Persistent JSON state path for cumulative totals.",
+    )
+    parser.add_argument(
+        "--cumulative-backfill-days",
+        type=int,
+        default=int(os.getenv("BOSCH_CUMULATIVE_BACKFILL_DAYS", "7")),
+        help="How many local days to scan when building cumulative totals.",
+    )
     parser.add_argument(
         "--timezone",
         default=os.getenv("BOSCH_TIMEZONE", os.getenv("TZ", "UTC")),
@@ -177,6 +189,80 @@ def sum_buckets(recording: list[dict[str, Any]], end_idx: int) -> float:
         if value is not None:
             total += value
     return round(total, 3)
+
+
+def clamp_end_idx(recording: list[dict[str, Any]], end_idx: int | None) -> int:
+    if not recording:
+        return -1
+    if end_idx is None:
+        return len(recording) - 1
+    return min(end_idx, len(recording) - 1)
+
+
+class BridgeStateStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.state = self._load()
+
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"version": 1, "sensors": {}}
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict) and isinstance(payload.get("sensors"), dict):
+                return payload
+        except Exception as err:
+            LOG.warning("Failed to load state file %s: %s", self.path, err)
+        return {"version": 1, "sensors": {}}
+
+    def _sensor_state(self, slug: str) -> dict[str, Any]:
+        sensors = self.state.setdefault("sensors", {})
+        sensor = sensors.setdefault(slug, {"total": 0.0, "buckets": {}})
+        sensor.setdefault("buckets", {})
+        sensor.setdefault("total", 0.0)
+        return sensor
+
+    def apply_buckets(
+        self,
+        slug: str,
+        bucket_date: date,
+        recording: list[dict[str, Any]],
+        end_idx: int | None,
+    ) -> tuple[float, bool]:
+        sensor = self._sensor_state(slug)
+        buckets = sensor["buckets"]
+        total = float(sensor.get("total", 0.0))
+        changed = False
+        final_idx = clamp_end_idx(recording, end_idx)
+        for idx, bucket in enumerate(recording):
+            if idx > final_idx:
+                break
+            value = safe_div(bucket.get("y", 0), bucket.get("c", 0))
+            if value is None:
+                continue
+            bucket_key = f"{bucket_date.isoformat()}T{idx:02d}"
+            previous = buckets.get(bucket_key)
+            if previous is None:
+                buckets[bucket_key] = value
+                total += value
+                changed = True
+                continue
+            previous_value = float(previous)
+            if round(previous_value, 3) != value:
+                buckets[bucket_key] = value
+                total += value - previous_value
+                changed = True
+        sensor["total"] = round(total, 3)
+        return sensor["total"], changed
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.path.parent, delete=False) as handle:
+            json.dump(self.state, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            tmp_path = Path(handle.name)
+        tmp_path.replace(self.path)
 
 
 class HomeAssistantMqttPublisher:
@@ -318,6 +404,26 @@ def publish_discovery(publisher: HomeAssistantMqttPublisher) -> None:
             payload["state_class"] = state_class
         publisher.discovery_sensor("sensor", object_id, payload)
 
+    cumulative_specs = [
+        ("compressor_runtime_total_hours", "Compressor Runtime Total", "h", None, "total_increasing"),
+        ("consumed_energy_total_kwh", "Consumed Energy Total", "kWh", "energy", "total_increasing"),
+        ("eheater_energy_total_kwh", "E-Heater Energy Total", "kWh", "energy", "total_increasing"),
+        ("output_produced_total_kwh", "Output Produced Total", "kWh", "energy", "total_increasing"),
+    ]
+    for object_id, name, unit, device_class, state_class in cumulative_specs:
+        payload = {
+            "name": name,
+            "unique_id": f"{publisher.device['identifiers'][0]}_{object_id}",
+            "state_topic": f"{publisher.topic_prefix}/{publisher.device['identifiers'][0]}/{object_id}/state",
+            "json_attributes_topic": f"{publisher.topic_prefix}/{publisher.device['identifiers'][0]}/{object_id}/attributes",
+            "unit_of_measurement": unit,
+        }
+        if device_class:
+            payload["device_class"] = device_class
+        if state_class:
+            payload["state_class"] = state_class
+        publisher.discovery_sensor("sensor", object_id, payload)
+
     diagnostics = [
         ("raw_energy_monitoring_consumption", "Raw Energy Monitoring Consumption", "kWh"),
         ("raw_energy_monitoring_start_datetime", "Raw Energy Monitoring Start", None),
@@ -390,6 +496,73 @@ def publish_live_values(client: BoschHttpClient, publisher: HomeAssistantMqttPub
 
 def fetch_recording_for_day(client: BoschHttpClient, path: str, target_date: date) -> dict[str, Any]:
     return client.get(f"{path}?interval={target_date.isoformat()}")
+
+
+def date_range_inclusive(end_date: date, days: int) -> list[date]:
+    days = max(days, 1)
+    start_date = end_date - timedelta(days=days - 1)
+    return [start_date + timedelta(days=offset) for offset in range(days)]
+
+
+def cutoff_for_bucket_date(bucket_date: date, target_date: date, last_hour_index: int) -> int | None:
+    if bucket_date < target_date:
+        return None
+    if bucket_date == target_date:
+        return last_hour_index
+    return -1
+
+
+def publish_cumulative_totals(
+    client: BoschHttpClient,
+    publisher: HomeAssistantMqttPublisher,
+    state_store: BridgeStateStore,
+    bridge_tz: ZoneInfo,
+    backfill_days: int,
+) -> None:
+    now = datetime.now(bridge_tz)
+    target_date, last_hour_index = get_last_full_hour_reference(now)
+    state_changed = False
+
+    for bucket_date in date_range_inclusive(target_date, backfill_days):
+        end_idx = cutoff_for_bucket_date(bucket_date, target_date, last_hour_index)
+        if end_idx == -1:
+            continue
+        for spec in RECORDING_SPECS:
+            try:
+                payload = fetch_recording_for_day(client, spec["path"], bucket_date)
+            except Exception as err:
+                LOG.warning("Failed cumulative read %s for %s: %s", spec["path"], bucket_date, err)
+                continue
+            recording = payload.get("recording", [])
+            if not recording:
+                continue
+            total_value, changed = state_store.apply_buckets(
+                slug=spec["slug"],
+                bucket_date=bucket_date,
+                recording=recording,
+                end_idx=end_idx,
+            )
+            state_changed = state_changed or changed
+            object_id = (
+                "compressor_runtime_total_hours"
+                if spec["slug"] == "compressor"
+                else f"{spec['slug']}_total_kwh"
+            )
+            publisher.publish_state(
+                object_id,
+                total_value,
+                {
+                    "path": payload["recordedResource"]["id"],
+                    "bridge_timezone": str(bridge_tz),
+                    "state_path": str(state_store.path),
+                    "backfill_days": backfill_days,
+                    "latest_processed_date": bucket_date.isoformat(),
+                    "latest_processed_hour": end_idx if end_idx is not None else len(recording) - 1,
+                },
+            )
+
+    if state_changed:
+        state_store.save()
 
 
 def publish_recording_summaries(
@@ -473,11 +646,13 @@ def publish_recording_summaries(
 def run_bridge(args: argparse.Namespace) -> int:
     mqtt = import_mqtt()
     bridge_tz = load_timezone(args.timezone)
+    state_store = BridgeStateStore(Path(args.state_path).expanduser().resolve())
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     LOG.info("Using recording timezone %s", bridge_tz)
+    LOG.info("Using cumulative state file %s", state_store.path)
 
     client = BoschHttpClient(
         host=args.host,
@@ -531,6 +706,13 @@ def run_bridge(args: argparse.Namespace) -> int:
                 LOG.info("Polling recording summaries")
                 try:
                     publish_recording_summaries(client, publisher, bridge_tz)
+                    publish_cumulative_totals(
+                        client,
+                        publisher,
+                        state_store,
+                        bridge_tz,
+                        args.cumulative_backfill_days,
+                    )
                 except Exception:
                     LOG.exception("Recording poll failed")
                 next_recordings = now + max(args.recordings_interval, 300)

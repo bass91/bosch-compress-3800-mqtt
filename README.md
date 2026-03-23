@@ -34,6 +34,8 @@ MQTT_HOST=192.168.68.149
 MQTT_PORT=1883
 MQTT_USER=bosch
 MQTT_PASSWORD=your_mqtt_password
+BOSCH_STATE_PATH=/data/bridge_state.json
+BOSCH_CUMULATIVE_BACKFILL_DAYS=7
 BOSCH_TIMEZONE=Europe/Stockholm
 ```
 
@@ -42,6 +44,8 @@ BOSCH_TIMEZONE=Europe/Stockholm
 ```bash
 docker compose up -d --build
 ```
+
+This creates a local `./state` directory on the server for cumulative totals.
 
 Logs:
 
@@ -60,9 +64,16 @@ docker compose down
 Set up the MQTT integration in Home Assistant against the same broker.
 The bridge publishes MQTT discovery under `homeassistant/...`, so entities should appear automatically.
 
+For Energy Dashboard, prefer the new cumulative MQTT sensors:
+- `Consumed Energy Total`
+- `E-Heater Energy Total`
+
+These are built from Bosch hourly buckets but exposed as monotonic `total_increasing` sensors.
+
 ## Notes
 
 - Live values are polled every `30s` by default.
 - Recording summaries are polled every `3600s` by default.
 - Daily recording rollovers use `BOSCH_TIMEZONE`, default `UTC`.
+- Cumulative totals survive container restarts via `BOSCH_STATE_PATH`.
 - Energy values are based on Bosch recording buckets, not live monotonic counters.
